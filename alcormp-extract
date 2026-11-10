@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""alcormp-extract: extract AlcorMP's tables and images for alcortool, once per release.
+
+  alcormp-extract ALCOR_U2_MP_v20.09.16.00.rar [more ...] [--to DIR]
+
+Standalone (Python standard library, plus 7z or unrar for .rar/.7z/.iso/.exe); alcortool only
+reads what this writes. It takes AlcorMP folders, or archives of them as downloaded
+(.zip/.tar natively; .rar/.7z/.iso/self-extracting .exe with 7z or unrar). It finds every
+AlcorMP folder (one holding FlashList.afl), unpacking archives and the archives inside them,
+and writes each to <data dir>/<version>/ (formats: docs/tools.md):
+  flashlist.tsv           FlashList.afl, decrypted: flash ID -> part record
+  ecc_params.tsv          DLL/EccParamFile.Dll: BCH ECC parameter records
+  LLF.dll                 DLL/LLF.dll verbatim: the test pattern
+  firmware/<api>/<ctl>/   UfdApi/UfdApi_<api>/CTL/<ctl>/ (and UfdCom/CTL/<ctl>/ as Com/<ctl>/),
+                          verbatim, every family present
+  SOURCE                  where it came from
+Nothing from a release is ever run: archives are unpacked, files are read and copied.
+"""
+import datetime
+import os
+import re
+import shutil
+import subprocess
+import struct
+import tarfile
+import tempfile
+import zipfile
+
+
+# == FLASHLIST.AFL CIPHER ==
+# RC4-like stream cipher (UfdComLib.dll), except the swap is an XOR-swap, which zeroes the
+# cell when i == j. Layout: header1 = crypt(file[0:256], KEY); header2 = crypt(file[256:512],
+# header1), starting with KEY, with the record stride at 0x28 and count at 0x2C; record r =
+# crypt(its stride bytes after 0x200, header1 with [0] = r, [255] = ~r).
+AFL_KEY = b"ALCORFLASHCFG_SZ"
+
+
+def crypt(data, key):
+    """Encrypt == decrypt."""
+    S = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + S[i] + key[i % len(key)]) & 0xFF
+        S[i] ^= S[j]; S[j] ^= S[i]; S[i] ^= S[j]           # noqa: E702  i == j zeroes S[i]
+    out, i, j = bytearray(len(data)), 0, 0
+    for n, c in enumerate(data):
+        i = (i + 1) & 0xFF
+        j = (j + S[i]) & 0xFF
+        S[i] ^= S[j]; S[j] ^= S[i]; S[i] ^= S[j]           # noqa: E702
+        out[n] = c ^ S[(S[i] + S[j]) & 0xFF]
+    return bytes(out)
+
+
+def afl_records(afl):
+    """Every decrypted FlashList record, in file order."""
+    hdr1 = crypt(afl[:256], AFL_KEY)
+    hdr2 = crypt(afl[256:512], hdr1)
+    if len(afl) < 0x200 or hdr2[:16] != AFL_KEY:
+        raise ValueError("not a FlashList.afl (header magic mismatch)")
+    stride, count = struct.unpack_from("<ii", hdr2, 0x28)
+    body = afl[0x200:]
+    return [crypt(body[r * stride:(r + 1) * stride], bytes([r & 0xFF]) + hdr1[1:255] + bytes([~r & 0xFF]))
+            for r in range(count)]
+
+
+# == EXPORT ==
+FLASHLIST_HEADER = """\
+# AlcorMP FlashList: flash ID -> part record, decrypted from FlashList.afl (alcormp-extract).
+# One row per part, in AlcorMP's order. `record` is the full record (hex); vendor/part are
+# its [0x00:0x10]/[0x10:0x30] strings, as labels. Record layout: docs/tools.md.
+flash_id\tvendor\tpart\trecord
+"""
+ECC_HEADER = """\
+# AlcorMP BCH ECC parameter records, from DLL/EccParamFile.Dll (alcormp-extract).
+# key = record[0:4] = mode, codeword, family, t (correction strength).
+key\trecord
+"""
+ECC_STRIDE, ECC_USED = 0x400, 0x332
+
+
+def find(root, *parts):
+    """root/parts, each component matched case-insensitively (releases differ in case)."""
+    path = root
+    for part in parts:
+        names = {n.lower(): n for n in os.listdir(path)} if os.path.isdir(path) else {}
+        if part.lower() not in names:
+            raise FileNotFoundError(f"{os.path.join(path, part)}: not in this AlcorMP folder")
+        path = os.path.join(path, names[part.lower()])
+    return path
+
+
+def cstr(b):
+    return b.split(b"\0")[0].decode("latin1")
+
+
+def export_flashlist(src, out):
+    recs = afl_records(open(find(src, "FlashList.afl"), "rb").read())
+    with open(os.path.join(out, "flashlist.tsv"), "w") as f:
+        f.write(FLASHLIST_HEADER)
+        for rec in recs:
+            f.write(f"{rec[0x30:0x36].hex(' ')}\t{cstr(rec[0:16])}\t{cstr(rec[16:48])}\t{rec.hex()}\n")
+    return f"{len(recs)} parts"
+
+
+def export_ecc(src, out):
+    db = open(find(src, "DLL", "EccParamFile.Dll"), "rb").read()
+    n = len(db) // ECC_STRIDE
+    with open(os.path.join(out, "ecc_params.tsv"), "w") as f:
+        f.write(ECC_HEADER)
+        for i in range(n):
+            rec = db[i * ECC_STRIDE:(i + 1) * ECC_STRIDE]
+            if any(rec[ECC_USED:]):
+                raise ValueError(f"EccParamFile.Dll record {i} is longer than {ECC_USED:#x} bytes")
+            f.write(f"{rec[:4].hex(' ')}\t{rec[:ECC_USED].hex()}\n")
+    return f"{n} records"
+
+
+def export_pattern(src, out):
+    shutil.copyfile(find(src, "DLL", "LLF.dll"), os.path.join(out, "LLF.dll"))
+    return f"{os.path.getsize(os.path.join(out, 'LLF.dll'))} bytes"
+
+
+def _families(src):
+    """(api, CTL dir) of every image family: UfdApi/UfdApi_<api>/CTL/<ctl>, UfdCom/CTL/<ctl> as Com."""
+    roots = []
+    try:
+        ufd = find(src, "UfdApi")
+        roots += [(d[len("ufdapi_"):], os.path.join(ufd, d)) for d in sorted(os.listdir(ufd))
+                  if d.lower().startswith("ufdapi_")]
+    except FileNotFoundError:
+        pass
+    try:
+        roots.append(("Com", find(src, "UfdCom")))
+    except FileNotFoundError:
+        pass
+    for api, base in roots:
+        try:
+            ctl_root = find(base, "CTL")
+        except FileNotFoundError:
+            continue
+        for ctl in sorted(os.listdir(ctl_root)):
+            if os.path.isdir(os.path.join(ctl_root, ctl)):
+                yield api, ctl, os.path.join(ctl_root, ctl)
+
+
+def export_firmware(src, out):
+    families = []
+    for api, ctl, path in _families(src):
+        shutil.copytree(path, os.path.join(out, "firmware", api, ctl))
+        families.append(f"{api}/{ctl}")
+    return ", ".join(families) or "none"
+
+
+def version_name(*names):
+    """A release name that sorts by date: AlcorMP(200916.MD) -> 200916.MD,
+    ALCOR_U2_MP_v20.09.16.00_8T23 -> 200916.00_8T23; else the first name as is."""
+    for name in names:
+        base = os.path.basename(os.path.normpath(name))
+        m = re.search(r"\((\d{6})([^()]*)\)", base)
+        if m:
+            return re.sub(r"[^\w.-]", "_", m.group(1) + m.group(2))
+        m = re.search(r"v(\d\d)\.(\d\d)\.(\d\d)\.(\d\d)([^/]*?)(\.(rar|zip|7z|exe|iso|tar|tgz))?$", base, re.I)
+        if m:
+            return re.sub(r"[^\w.-]", "_", "".join(m.groups()[:3]) + "." + m.group(4) + m.group(5))
+    return re.sub(r"[^\w.-]", "_", os.path.basename(os.path.normpath(names[0])))
+
+
+# == ARCHIVES ==
+ARCHIVES = (".zip", ".rar", ".7z", ".iso", ".tar", ".tgz", ".tar.gz", ".tar.xz", ".tar.bz2", ".exe")
+NESTED_MAX = 3
+
+
+def is_archive(path):
+    return os.path.isfile(path) and path.lower().endswith(ARCHIVES)
+
+
+def _inside(root, member):
+    dest = os.path.realpath(os.path.join(root, member))
+    return dest == os.path.realpath(root) or dest.startswith(os.path.realpath(root) + os.sep)
+
+
+# Passwords that AlcorMP distribution sites publish for their archives, tried after --password.
+# usbdev.ru: "на часть файлов ... установлен пароль (password) = usbdev.ru".
+KNOWN_PASSWORDS = ("usbdev.ru",)
+
+
+class WrongPassword(ValueError):
+    pass
+
+
+def _unpack_once(path, into, pw):
+    low = path.lower()
+    if low.endswith(".zip"):
+        with zipfile.ZipFile(path) as z:
+            bad = [m for m in z.namelist() if not _inside(into, m)]
+            if bad:
+                raise ValueError(f"{path}: members outside the archive root: {bad[:3]}")
+            try:
+                z.extractall(into, pwd=pw.encode() if pw else None)
+            except RuntimeError as e:                      # zipfile: encrypted, wrong or no password
+                raise WrongPassword(str(e))
+        return
+    if low.endswith((".tar", ".tgz", ".tar.gz", ".tar.xz", ".tar.bz2")):
+        with tarfile.open(path) as t:
+            members = [m for m in t.getmembers() if (m.isfile() or m.isdir()) and _inside(into, m.name)]
+            t.extractall(into, members)
+        return
+    unsupported = []
+    for tool in ("7z", "7zz", "7za", "unrar"):
+        if not shutil.which(tool) or (tool == "unrar" and not low.endswith(".rar")):
+            continue
+        cmd = ([tool, "x", "-y", f"-p{pw or '-'}", "-idq", path, into + os.sep] if tool == "unrar" else
+               [tool, "x", "-y", "-bd", f"-p{pw}", f"-o{into}", path])      # -p: never prompt
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if r.returncode == 0:
+            return
+        if re.search(r"unsupported method|can ?not open the file as archive", r.stdout, re.I):
+            unsupported.append(tool)                      # e.g. a 7z built without the RAR codec
+            continue
+        if re.search(r"wrong password|incorrect password|encrypted|password", r.stdout, re.I):
+            raise WrongPassword(f"{path}: encrypted")
+        raise ValueError(f"{path}: {tool} failed: {' '.join(r.stdout.split())[-200:]}")
+    need = ("RAR support: 7z with the RAR codec (Debian/Ubuntu: apt install 7zip 7zip-rar, from non-free) "
+            "or unrar" if low.endswith(".rar") else "7z (Debian/Ubuntu: apt install 7zip)")
+    raise ValueError(f"{path}: unpacking needs {need}" + (f"; {', '.join(unsupported)} cannot open it" if unsupported else "")
+                     + ". Or unpack it yourself and extract from the folder.")
+
+
+def unpack(path, into, password=None):
+    """Unpack an archive into `into`, trying `password`, then KNOWN_PASSWORDS; members that
+    would land outside `into` are refused."""
+    tries = [password or ""] + [p for p in KNOWN_PASSWORDS if p != password]
+    for pw in tries:
+        shutil.rmtree(into, ignore_errors=True)
+        os.makedirs(into)
+        try:
+            _unpack_once(path, into, pw)
+            return pw
+        except WrongPassword:
+            continue
+    raise ValueError(f"{path} is encrypted and none of the known passwords opens it: pass --password")
+
+
+def discover(path, work, depth=0, log=print, password=None):
+    """[(AlcorMP folder, name hint)] at or under `path`. An archive is unpacked under `work`;
+    archives inside an unpacked tree are opened only when it holds no AlcorMP folder."""
+    hint = path
+    if os.path.isfile(path):
+        if not is_archive(path):
+            return []
+        dst = tempfile.mkdtemp(prefix="unpack-", dir=work)
+        log(f"unpacking {path}")
+        pw = unpack(path, dst, password)
+        if pw:
+            log(f"  (password {pw!r})")
+        path = dst
+    found = sorted(d for d, _, files in os.walk(path) if any(f.lower() == "flashlist.afl" for f in files))
+    if found or depth >= NESTED_MAX:
+        return [(d, hint) for d in found]
+    nested = sorted(os.path.join(d, f) for d, _, files in os.walk(path) for f in files
+                    if f.lower().endswith(ARCHIVES) and not f.lower().endswith(".exe"))
+    return [hit for a in nested for hit in discover(a, work, depth + 1, log, password)]
+
+
+def default_dir():
+    """$ALCORTOOL_DATA (its first entry), else alcormp/ beside this script if writable, else
+    the per-user data dir: all places alcortool searches (docs/tools.md)."""
+    env = os.environ.get("ALCORTOOL_DATA", "").split(os.pathsep)[0]
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    if os.access(here, os.W_OK):
+        return os.path.join(here, "alcormp")
+    return os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "alcortool")
+
+
+def import_alcormp(src, name=None, root=None, hint=None, log=print):
+    """Export one AlcorMP release into root/<name>/ (replaced whole if it exists)."""
+    root = root or default_dir()
+    dst = os.path.join(root, name or version_name(src, *([hint] if hint else [])))
+    tmp = dst + ".importing"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    log(f"{src} -> {dst}")
+    try:
+        for what, fn in (("flashlist.tsv", export_flashlist), ("ecc_params.tsv", export_ecc),
+                         ("LLF.dll", export_pattern), ("firmware/", export_firmware)):
+            log(f"  {what:15} {fn(src, tmp)}")
+        with open(os.path.join(tmp, "SOURCE"), "w") as f:
+            f.write(f"{os.path.basename(os.path.normpath(hint or src))}\t{os.path.basename(src)}\t"
+                    f"imported {datetime.date.today().isoformat()}\n")
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    replaced = os.path.exists(dst)
+    shutil.rmtree(dst, ignore_errors=True)
+    os.rename(tmp, dst)
+    log(f"  {'replaced' if replaced else 'imported'}")
+    return dst
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(prog="alcormp-extract", description=__doc__.split("\n\n")[0].split(": ", 1)[1],
+                                 epilog="Layout and formats: docs/tools.md.")
+    ap.add_argument("path", nargs="+", help="AlcorMP folders or archives as downloaded (.zip .rar .7z .iso .exe), "
+                    "or folders holding them")
+    ap.add_argument("--to", metavar="DIR", help=f"data directory (default: {default_dir()})")
+    ap.add_argument("--password", help="archive password (the known public ones are tried anyway: "
+                    + ", ".join(KNOWN_PASSWORDS) + ")")
+    ap.add_argument("--name", help="release name (default: its date, e.g. AlcorMP(200916.MD) -> 200916.MD)")
+    args = ap.parse_args()
+    root = args.to or default_dir()
+    with tempfile.TemporaryDirectory(prefix="alcormp-extract-") as work:
+        try:
+            found = [hit for p in args.path for hit in discover(p, work, password=args.password)]
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"alcormp-extract: {e}")
+        if not found:
+            raise SystemExit(f"no AlcorMP release (a folder holding FlashList.afl) in {', '.join(args.path)}")
+        if args.name and len(found) > 1:
+            raise SystemExit(f"--name needs a single AlcorMP release; found {len(found)}")
+        for src, hint in found:
+            try:
+                import_alcormp(src, args.name, root, hint)
+            except (OSError, ValueError) as e:
+                raise SystemExit(f"{src}: extraction failed: {e}")
+    print(f"releases in {root}: " + ", ".join(sorted(os.listdir(root), reverse=True)))
+
+
+if __name__ == "__main__":
+    main()

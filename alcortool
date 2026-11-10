@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""alcortool launcher: python3 -m alcor."""
+from alcor.cli import main
+
+main()

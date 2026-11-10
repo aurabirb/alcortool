@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# AlcorMP data: alcortool extract / ./alcormp-extract <AlcorMP archive or folder> (docs/data.md)
+alcormp/
+# per-stick backups: serials, identity, disk images
+firmware/dumps/
+# research: decompiled AlcorMP code, disassembly, evidence and tools (kept local)
+re/
