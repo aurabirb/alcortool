@@ -157,6 +157,12 @@ def hex_decode(raw):
     return bytes.fromhex(re.sub(rb"[^0-9A-Fa-f]", b"", raw).decode())
 
 
+def hex_encode(data):
+    """Bytes as AlcorMP writes an image: upper-case hex, 16 bytes a line, CRLF between."""
+    return b"\r\n".join(data[i:i + 16].hex().upper().encode() for i in range(0, len(data), 16))
+
+
+
 def load_image(name):
     path = find_image(name)
     if not path:
@@ -190,6 +196,21 @@ def boot_fw_image(flash_id):
 
 def device_bootfw(flash_id):
     return load_image(boot_fw_image(flash_id))
+
+
+def exact_boot_fw(image, ignore=()):
+    """The imported _CB image that `image` is byte for byte outside the positions in
+    `ignore` (the per-stick self-descriptor), or None; None without imported data."""
+    keep = sorted(set(range(len(image))) - set(ignore))
+    try:
+        cbs = [p for n, p in images().items() if n.endswith("_cb.bin")]
+    except DataMissing:
+        return None
+    for path in cbs:
+        img = hex_decode(open(path, "rb").read())
+        if len(img) == len(image) and all(img[i] == image[i] for i in keep):
+            return os.path.basename(path)
+    return None
 
 
 def identify_boot_fw(code, window=16):

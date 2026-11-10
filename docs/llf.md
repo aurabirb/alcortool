@@ -35,7 +35,7 @@ Things worth knowing first:
 
 - **Identify** (`9A`, `FA 0E`): chip ID, and whether the firmware is locked (`FA 0E` refused).
 - **Flash ID** (`FA 00`): selects the part's FlashList record, hence geometry, ECC and the
-  boot firmware image.
+  bundled boot firmware image, written when the backup captured none.
 - **Registers and code** (`FA 13`, `FA 10`): the NAND trim values that go into the FTL
   configuration record.
 

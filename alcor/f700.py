@@ -38,6 +38,7 @@ LOADER_BASE = 0xC000                    # where the upload's first 0x2000 bytes 
 # role: source. They get the patch constants and these fields only: the ROM stores the
 # geometry fields in registers for the NAND code, which these loaders do not have.
 OWN_LOADERS = {"probe": "probe.a51"}
+CAPTURE_LOADER = "capture.a51"          # stub over the stick's own page0 (BOOT FIRMWARE CAPTURE)
 OWN_PATCH = {0x06: 0x01}                # one CE; used when the stick's own set-up is not read
 
 # The patch window from the stick itself. The ROM loads at boot (CODE:45F1) the NAND set-up an
@@ -276,3 +277,18 @@ RECORD_UFDMODE = (0x34, 0x38, 0x39, 0x3A, 0x3B)   # the flags holding UFDMode bi
 
 # == CODE SPACE ==
 BOOT_FW_WINDOW = (0x8000, 0x4000)       # where the running boot firmware shows through FA 10
+
+# == BOOT FIRMWARE CAPTURE (docs/processes.md, capturing the boot firmware) ==
+# Overlays are stored scrambled; the ROM's overlay loader descrambles one into OVERLAY_AT when
+# page0's select routine asks. The capture uploads the stick's own page0 as a RAM loader: slot
+# FW_BLOCK_SLOT (read firmware block n, which the ROM's overlay loader calls) stays, the
+# ROM-facing slots get the probe loader's constants, and a stub over an unused slot handler
+# calls the select routine (protocol.CAPTURE_SUB).
+BOOT_OVERLAYS = 10                      # page0 + overlays 0-9: the 44-KB image
+PAGE_SIZE_FW = 0x1000                   # page0 and each overlay
+OVERLAY_AT = 0xD000                     # trailer [n] [~n] 55 AA at +0xFFC
+PAGE0_TAG = b"\x01\x00"                 # page0's trailer index bytes (+0xFFC)
+OVERLAY_SELECT = bytes.fromhex("8f6490dffce493")   # head: MOV 0x64,R7; MOV DPTR,#0xDFFC; CLR A; MOVC
+FW_BLOCK_SLOT = 13
+LOADER_SLOTS = 31
+CONST_SLOTS = {2: 0x80, 3: 0x01, 7: 0x01, 19: 0x00, 22: 0x01}   # slot: R7 the ROM expects (MOV R7,#v; RET)

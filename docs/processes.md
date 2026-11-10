@@ -38,8 +38,18 @@ The firmware is larger than its 8-KB window, so it swaps overlays in on demand.
 - **Cache check**: if the index stored at the end of the window is already n, nothing happens.
 - **Load**: otherwise the ROM starts a hardware page read of the overlay's NAND page, from
   one of its redundant copies; a copy that fails to read is dropped.
-- Overlays 1-9 are stored scrambled; the firmware reads them through the transfer engine
-  with a per-page seed.
+- Overlays 1-9 are stored scrambled; the load descrambles them in hardware.
+
+### Capturing the boot firmware
+
+Only the overlay load descrambles, so `alcortool backup` lets the stick's own firmware load
+each overlay and reads it from the window. RAM only: nothing is written to the NAND.
+
+- **Page0**: read from the window (`FA 10`).
+- **Upload** page0 as a RAM loader, with a small stub that asks it for an overlay
+  (`alcor/loaders/capture.a51`).
+- **Each overlay** (`FA 0B E6`): loaded by page0, read from the window, checked by its trailer.
+- **USB bus reset**: the firmware restarts from NAND.
 
 ## Mount
 
@@ -166,7 +176,7 @@ the housekeeping block and the data.
   current capacity (or `--capacity`), identity and boot sector.
 
 It needs a working stick: a locked one has no `FA` access, a blank one has nothing to keep.
-`--dry-run` stops after the read-back (MP mode is RAM only: replug afterwards). `--blind` skips the read-back and writes the
+`--dry-run` stops after the read-back and leaves MP mode with a USB reset. `--blind` skips the read-back and writes the
 clean-die layout with a generated identity, for a stick in ROM mode; whether it then mounts is
 untested.
 
@@ -194,6 +204,7 @@ stick here; running the format again recovers it.
 
 - **Replies**: every read-only command's reply, the config block among them.
 - **CODE**: the 64-KB CODE space (`FA 10`).
+- **Boot firmware**: [captured](#capturing-the-boot-firmware); not on a locked stick or in ROM mode.
 - **Manifest**: chip, flash ID, serial, firmware revision and image, disk geometry.
 - **Disk** (with `--data`): every sector of the logical disk.
 
@@ -202,6 +213,9 @@ stick here; running the format again recovers it.
 - `--identity`: the config block only.
 - `--data`: the disk image only.
 - `--full`: a format that writes the dump's boot image and identity, then the disk image.
+
+A format keeps the stick's firmware: it writes what its backup captured, else the bundled
+image. `alcortool firmware IMAGE` swaps it later; IMAGE is a `.BIN` file or a backup.
 
 The FTL is not restored byte for byte: the format rebuilds it and the disk content goes back
 on top. A raw NAND dump cannot serve as a backup (scrambled pages, device-made tables).

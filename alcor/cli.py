@@ -124,7 +124,6 @@ def pick_device(args):
 def session(args):
     """An open session on the chosen device, probed when it is not a 058F device."""
     dev, ids = pick_device(args)
-    port = usb_port(dev)                                   # sysfs path goes with usb-storage
     try:
         s = Session(dev, verbose=args.verbose)
     except PermissionError as e:
@@ -134,7 +133,7 @@ def session(args):
     if ids[0].lower() != f700.USB_VID and not probe_controller(s)["ok"]:
         s.close()
         sys.exit(f"/dev/{dev} [{ids[0]}:{ids[1]}] is not an Alcor controller; refusing")
-    s.dev, s.ids, s.port = dev, ids, port
+    s.dev, s.ids = dev, ids
     return s
 
 
@@ -631,7 +630,8 @@ def parser():
     p.add_argument("--dry-run", action="store_true", help="show the plan and the stream; send nothing")
     yes(p)
     p = add("firmware", cmd_firmware, "rewrite the boot firmware only, keeping the FTL and the data")
-    p.add_argument("image", nargs="?", help="boot image (AlcorMP .BIN or raw; default: the bundled one)")
+    p.add_argument("image", nargs="?", help="boot image: a .BIN file or a backup directory; "
+                   "default: the bundled one")
     p.add_argument("--capacity", type=parse_capacity, metavar="SIZE", help="new size (default: keep)")
     p.add_argument("--blind", action="store_true", help="no read-back: write the clean-die layout (ROM mode)")
     p.add_argument("--dry-run", action="store_true", help="read back and validate only")

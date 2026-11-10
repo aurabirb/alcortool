@@ -185,6 +185,12 @@ or data: its patch window comes from the stick's own NAND set-up.
 | `E4` | 4-8 address cycles, 9 sectors, 10 prefix | sectors in | raw page read: data, parity and spare as stored; optional prefix command (e.g. `DA`) |
 | `E5` | 4-6 row | 512 B in | block erase, returns the status |
 
+Under the [firmware capture](processes.md#capturing-the-boot-firmware) loader:
+
+| sub | CDB fields | data | effect |
+|---|---|---|---|
+| `E6` | 4 overlay | — | load the overlay into the window |
+
 ## NAND commands
 
 What the controller sends to the NAND chip: standard ONFI command and address cycles. Every

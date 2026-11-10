@@ -215,13 +215,13 @@ class Format(Stream):
     """The LLF stream. Each method is one phase, in order (docs/llf.md)."""
 
     def __init__(self, geo, identity=None, capacity_limit=None, fw_update=None, sweeps="full",
-                 kept_status=None):
+                 kept_status=None, bootfw=None):
         super().__init__(geo)
         self.L = L = Layout(geo)
         self.identity, self.capacity_limit, self.sweep_mode = identity, capacity_limit, sweeps
         self.fw_update, self.kept_status = fw_update, kept_status
         self.stored = bool(fw_update and fw_update.get("blocks"))
-        self.bootfw = fw_update["image"] if fw_update else device_bootfw(geo.fid)
+        self.bootfw = fw_update["image"] if fw_update else bootfw or device_bootfw(geo.fid)
         if fw_update:
             self.identity, self.capacity_limit = fw_update["identity"], fw_update["capacity"]
         self.anchors = ([fw_update["blocks"][b]["anchor"] for b in (SYS_BLOCK, MIRROR_BLOCK)] if self.stored
@@ -839,12 +839,13 @@ def trim(ops, skip):
 
 
 def generate(geo, with_enable=True, identity=None, capacity_limit=None, fw_update=None,
-             sweeps="full", skip=(), kept_status=None):
+             sweeps="full", skip=(), kept_status=None, bootfw=None):
     """The LLF stream. with_enable=False: the session is already MP-enabled (rwfw).
     sweeps: full | erase (die-wide erases only) | none. fw_update: a read_fw_layout result
     (or blocks=None for blind); the stream is then the firmware pass and closing only.
-    kept_status: a stored block-status table that replaces the sweeps' verdict."""
-    f = Format(geo, identity, capacity_limit, fw_update, sweeps, kept_status)
+    kept_status: a stored block-status table that replaces the sweeps' verdict. bootfw: the
+    boot image to write (default: the bundled one for the part)."""
+    f = Format(geo, identity, capacity_limit, fw_update, sweeps, kept_status, bootfw)
     if with_enable:
         f.enable()
     for phase in (f.scratch_test, f.screen, f.ftl_build_a, f.boundary_loop_a, f.ftl_build_b,

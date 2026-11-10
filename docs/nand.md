@@ -33,14 +33,14 @@ returns other bytes.
 
 ## Randomizer
 
-Some pages are scrambled when written, so raw reads of them look random. The firmware reads
-them through the transfer engine with a per-page seed.
+Some pages are scrambled when written, so raw reads of them look random. Only the overlay
+load descrambles them ([capturing the firmware](processes.md#capturing-the-boot-firmware)).
 
 | item | value |
 |---|---|
 | scrambled | block 0 pages `0x04`-`0x0C` (firmware overlays 1-9) |
 | plain | block 0 pages `0x00`-`0x03` and `0x0D` |
-| switch | the `FA 0B` region bytes: `ff ff 01 00` on scrambled pages, `ff ff 00 00` on plain (?) |
+| switch | write region bytes: `ff ff 01 00` scrambled, `ff ff 00 00` plain |
 | seed rule | (unknown) |
 
 ## Block layout

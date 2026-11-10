@@ -3,9 +3,9 @@ byte-exact comparison against AlcorMP's captures is re/oracle_selftest.py."""
 import builtins
 
 from . import asm51, f700, ftlcrypt, provision
-from .nand import DataMissing, Geometry, device_bootfw, loader_image, releases
+from .nand import DataMissing, Geometry, boot_fw_image, device_bootfw, find_image, hex_encode, loader_image, releases
 from .payloads import (bad_columns, build_anchor, build_wp_block, build_column_table, build_index_page, build_loader_patch,
-                       build_param, config_valid, own_loader_image)
+                       build_param, config_valid, own_loader_image, page0_loader_image)
 from .protocol import COMMANDS, PROBE_SIGNATURE, erase_cdb, nand_cdb
 
 REFERENCE = "2c 84 44 32 aa 04"         # F700 + Micron L05B, the part both captures ran on
@@ -51,7 +51,26 @@ def builders():
     return (len(p) == 2048 and p[0] == g.ce_count and p[0x59] == 0xDA and len(a) == 0x80 and a[0x2E] == 0xDA
             and a[:5] == f700.ANCHOR_MAGIC and a[0x32:0x35] != m[0x32:0x35]
             and len(loader_image("rwfw", build_loader_patch(g))) == f700.LOADER_UPLOAD
-            and device_bootfw(g.fid)[:3] == bytes.fromhex("02d51f") and idx[:4] == bytes(range(4)))
+            and device_bootfw(g.fid)[:3] == bytes.fromhex("02d51f") and idx[:4] == bytes(range(4))
+            and capture_loader(device_bootfw(g.fid))
+            and hex_encode(device_bootfw(g.fid)) == open(find_image(boot_fw_image(g.fid)), "rb").read())
+
+
+def capture_loader(bootfw):
+    """The boot-firmware capture loader built over a page0: slot 13 kept, the ROM's constant
+    slots, a stub that calls the select routine and lies off the overlay-load path."""
+    base = f700.LOADER_BASE
+    code = bytearray(0x10000)
+    code[base:base + 0x2000] = bootfw[:0x2000]
+    img = page0_loader_image(bytes(code))
+    slot = lambda n: int.from_bytes(img[3 * n + 1:3 * n + 3], "big")
+    select = base + bootfw.index(f700.OVERLAY_SELECT)
+    stub = img[slot(4) - base:slot(4) - base + 0x20]
+    path = asm51.reached(bytes(code), [select])
+    return (len(img) == f700.LOADER_UPLOAD and img[:3 * f700.FW_BLOCK_SLOT + 3][-3:] == bootfw[39:42]
+            and all(img[slot(n) - base:slot(n) - base + 2] == bytes((0x7F, v)) for n, v in f700.CONST_SLOTS.items())
+            and b"\x12" + select.to_bytes(2, "big") in stub and not any(a in path for a in range(slot(4), slot(4) + 18))
+            and img[f700.LOADER_PATCH_AT + 0x1FE:f700.LOADER_PATCH_AT + 0x200] == b"JN")
 
 
 @check

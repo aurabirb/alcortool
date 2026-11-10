@@ -228,7 +228,7 @@ The ROM calls fixed slots, so their meaning is shared across loaders while their
 | others | — | most are a bare `RET` |
 
 A loader needs no more than that: one whose slots are all stubs except its own slot 4 runs
-(the tool's probe loader is built this way).
+(the tool's probe loader is built this way). The boot firmware's page0 follows the same contract.
 
 What a loader can rely on when slot 4 runs:
 

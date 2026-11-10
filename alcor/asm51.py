@@ -114,6 +114,36 @@ def disasm(code, org=0):
     return out
 
 
+_BRANCH = {"LCALL", "ACALL", "LJMP", "AJMP", "SJMP", "JZ", "JNZ", "JC", "JNC", "JB", "JNB", "JBC", "CJNE", "DJNZ"}
+
+
+def reached(code, entries):
+    """Addresses of the instructions direct flow reaches from `entries` in a 64-KB CODE
+    image, following calls; computed jumps (JMP @A+DPTR) end a path."""
+    seen, todo = set(), list(entries)
+    while todo:
+        pc = todo.pop()
+        while pc not in seen and pc < len(code):
+            seen.add(pc)
+            _, raw, text = disasm(code[pc:pc + 3], pc)[0]
+            mn = text.split()[0]
+            if mn in _BRANCH:
+                todo.append(int(re.findall(r"0x([0-9A-F]{4})", text)[-1], 16))
+            if mn in ("LJMP", "AJMP", "SJMP", "RET", "RETI") or mn == "JMP":
+                break
+            pc += len(raw)
+    return seen
+
+
+def targets(code, org):
+    """Every address a branch in a linear decode of `code` names."""
+    out = set()
+    for _, _, text in disasm(code, org):
+        if text.split()[0] in _BRANCH:
+            out.add(int(re.findall(r"0x([0-9A-F]{4})", text)[-1], 16))
+    return out
+
+
 # == ASSEMBLER ==
 class AsmError(Exception):
     pass

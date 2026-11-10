@@ -72,6 +72,7 @@ class Session:
 
     def __init__(self, blockdev, timeout_ms=10000, verbose=0):
         self.timeout, self.blockdev, self.tag, self.verbose = timeout_ms, blockdev, 1, verbose
+        self.port = usb_port(blockdev)                     # sysfs path goes with usb-storage
         iface = find_interface(blockdev)
         dev = os.path.dirname(iface)
         rd = lambda p: open(p).read().strip()
@@ -115,6 +116,11 @@ class Session:
         deadline = time.monotonic() + 8                    # usb-storage rescans asynchronously
         while self.alive() and not os.path.exists(f"/sys/block/{self.blockdev}") and time.monotonic() < deadline:
             time.sleep(0.1)
+
+    def takeover(self, other):
+        """Continue as `other`, a session on the stick after it re-enumerated."""
+        self.close()
+        self.__dict__.update(other.__dict__)
 
     def reset(self):
         """USB bus reset with the interface still claimed: the controller restarts from NAND

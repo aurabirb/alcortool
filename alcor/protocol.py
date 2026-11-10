@@ -120,12 +120,18 @@ SUBS = {
 # command (read: the raw page, byte by byte); [4:7] row (erase).
 PROBE_SUBS = {"ident": 0xE0, "xread": 0xE1, "xwrite": 0xE2, "nandcmd": 0xE3, "read": 0xE4, "erase": 0xE5}
 PROBE_SIGNATURE = b"alcortool probe 5"
+CAPTURE_SUB = 0xE6                      # capture loader: CDB[4] = the overlay to load
 ONFI = {"read_id": 0x90, "param_page": 0xEC, "slc": 0xDA}  # NAND commands; DAh: Micron SLC-mode prefix
 
 
 def xdata_page_cdb(page):
     """FA 13 00 PP: 512 B of XDATA from PP00, served by the ROM in normal mode too."""
     return bytes((0xFA, 0x13, 0x00, page, 0, 0, 0, 0))
+
+
+def capture_cdb(overlay):
+    """Under the boot-firmware capture loader (alcor/loaders/capture.a51): load `overlay`."""
+    return bytes((0xFA, 0x0B, CAPTURE_SUB, 0, overlay)).ljust(16, b"\0")
 
 
 def probe_cdb(name, addr=0, value=0, sectors=0):

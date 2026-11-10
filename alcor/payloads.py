@@ -9,6 +9,7 @@ import secrets
 
 from . import asm51, f700, ftlcrypt
 from .nand import ecc_param_record, llf_pattern, module_feature, module_name
+from .protocol import CAPTURE_SUB, LoaderError
 
 
 def be16(v):
@@ -101,6 +102,12 @@ def own_loader_image(role, xdata=None):
     code, _ = asm51.assemble(src, org=f700.LOADER_BASE)
     if len(code) > f700.LOADER_PATCH_AT:
         raise ValueError(f"{role} loader: {len(code)} B does not fit below the patch window")
+    return (code.ljust(f700.LOADER_PATCH_AT, b"\xff") + loader_patch(xdata)).ljust(f700.LOADER_UPLOAD, b"\0")
+
+
+def loader_patch(xdata=None):
+    """An own loader's patch window: the constants, then the stick's NAND set-up from
+    `xdata` ({address: byte}, f700.PATCH_FROM_STICK), else OWN_PATCH."""
     patch = bytearray(f700.LOADER_PATCH_LEN)
     put(patch, f700.LOADER_PATCH_CONST)
     if xdata is None:
@@ -108,7 +115,40 @@ def own_loader_image(role, xdata=None):
     else:
         for off, addr in f700.PATCH_FROM_STICK.items():
             patch[off] = xdata[addr]
-    return (code.ljust(f700.LOADER_PATCH_AT, b"\xff") + patch).ljust(f700.LOADER_UPLOAD, b"\0")
+    return bytes(patch)
+
+
+def page0_loader_image(code, xdata=None):
+    """The boot-firmware capture loader (f700, BOOT FIRMWARE CAPTURE) from a 64-KB CODE dump of
+    the running firmware: its page0 and resident overlay, the ROM-facing slots stubbed, the
+    capture stub over the first slot handler that the overlay-load path neither runs nor
+    jumps into. LoaderError if page0 is not recognised."""
+    base, size = f700.LOADER_BASE, f700.PAGE_SIZE_FW
+    win = bytearray(code[base:base + f700.LOADER_PATCH_AT])
+    if win[size - 4:size - 2] != f700.PAGE0_TAG or win[3 * f700.FW_BLOCK_SLOT] != 0x02:
+        raise LoaderError("no boot firmware page0 in the CODE window")
+    at = win.find(f700.OVERLAY_SELECT, 0, size)
+    if at < 0:
+        raise LoaderError("page0 has no overlay select routine")
+    src = open(os.path.join(LOADER_DIR, f700.CAPTURE_LOADER)).read()
+    symbols = {"SELECT": base + at, "SUB": CAPTURE_SUB}
+    stub_len = len(asm51.assemble(src, base, {**symbols, "STUB": base})[0])
+    path = asm51.reached(code, [base + at])
+    jumps = asm51.targets(bytes(win), base)
+    slot = lambda n: int.from_bytes(win[3 * n + 1:3 * n + 3], "big")
+    free = [t for t in map(slot, range(f700.LOADER_SLOTS))
+            if base + 3 * f700.LOADER_SLOTS <= t <= base + size - stub_len
+            and not any(a in path or (a in jumps and a != t) for a in range(t, t + stub_len))]
+    if not free:
+        raise LoaderError("page0 has no slot handler free for the capture stub")
+    stub, sym = asm51.assemble(src, free[0], {**symbols, "STUB": free[0]})
+    win[free[0] - base:free[0] - base + len(stub)] = stub
+    for n in range(f700.LOADER_SLOTS):
+        if n != f700.FW_BLOCK_SLOT:
+            v = f700.CONST_SLOTS.get(n)
+            t = sym["capture" if n == 4 else "done" if v is None else "result" if v == 0 else f"ret_{v:02x}"]
+            win[3 * n:3 * n + 3] = bytes((0x02, t >> 8, t & 0xFF))
+    return (bytes(win) + loader_patch(xdata)).ljust(f700.LOADER_UPLOAD, b"\0")
 
 
 # == ONFI ==

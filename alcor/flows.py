@@ -7,15 +7,18 @@ import sys
 import time
 
 from . import f700, provision
-from .device import (BotError, CommandFailed, MpSession, Session, disk_geometry, drive, firmware_locked,
+from .device import (BotError, CommandFailed, MpSession, Progress, Session, disk_geometry, drive, firmware_locked,
                      flash_id, read, read_code, read_disk, reopen_on_port, usb_port, wait_for_rom_mode,
                      write_accepted, write_and_verify, write_disk)
-from .nand import Geometry, boot_fw_image, device_bootfw, hex_decode, identify_boot_fw
+from .nand import (DataError, Geometry, boot_fw_image, device_bootfw, exact_boot_fw, hex_decode, hex_encode,
+                   identify_boot_fw)
 from .payloads import (build_wp_block, config_serial, config_valid, decode_record, default_config, HK_STATUS,
-                       hk_decode, nand_address, onfi_geometry, own_loader_image, record_capacity, usb_string)
-from .protocol import (COMMANDS, ONFI, PROBE_SIGNATURE, READS, code_cdb, probe_cdb, probe_nand_cdb,
-                       xdata_page_cdb)
+                       descriptor_mask, hk_decode, nand_address, onfi_geometry, own_loader_image, page0_loader_image, record_capacity,
+                       usb_string)
+from .protocol import (COMMANDS, ONFI, PROBE_SIGNATURE, READS, LoaderError, capture_cdb, code_cdb, probe_cdb,
+                       probe_nand_cdb, xdata_page_cdb)
 
+BOOTFW_FILE = "bootfw.bin"
 DUMPS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "firmware", "dumps")
 
 ROM_MODE_HELP = """\
@@ -95,7 +98,9 @@ def restart(s, port):
 # == BACKUP / RESTORE ==
 def backup(s, root=DUMPS_DIR, data=False, log=print):
     """Read-only backup into root/<flash id>_<serial>_<time>/: every READS reply, the CODE
-    space, manifest.json naming the boot image it runs, with `data` the whole disk."""
+    space, the boot firmware as stored (bootfw.bin, captured through the stick's own overlay
+    loader: RAM only, then a USB reset that `s` survives), manifest.json naming the boot image,
+    with `data` the whole disk."""
     replies = {}
     for name in READS:
         try:
@@ -110,13 +115,18 @@ def backup(s, root=DUMPS_DIR, data=False, log=print):
     win = code[f700.BOOT_FW_WINDOW[0]:sum(f700.BOOT_FW_WINDOW)]
     image, frac = identify_boot_fw(win)
     inq = replies.get("inquiry", b"")
+    bootfw, why = capture_boot_fw(s, code, log)
+    exact = bundled_boot_fw(bootfw, fid) if bootfw else None
     manifest = {
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "chip": f"{chip:04X}" if chip is not None else None,
         "flash_id": fid.hex(" "), "serial": serial,
         "firmware_rev": inq[32:36].decode(errors="replace").strip() if len(inq) >= 36 else None,
-        "boot_fw": {"bundled_image": image if frac >= 0.9 else None, "match": round(frac, 3),
-                    "window_sha1": hashlib.sha1(win).hexdigest()},
-        "files": ["code.bin"] + [f"replies/{n}.bin" for n in replies],
+        "boot_fw": {"bundled_image": exact if bootfw else image if frac >= 0.9 else None,
+                    "closest": image, "match": round(frac, 3),
+                    "window_sha1": hashlib.sha1(win).hexdigest(),
+                    **({"image": BOOTFW_FILE, "sha1": hashlib.sha1(bootfw).hexdigest()} if bootfw
+                       else {"not_captured": why})},
+        "files": ["code.bin"] + ([BOOTFW_FILE] if bootfw else []) + [f"replies/{n}.bin" for n in replies],
     }
     out = os.path.join(root, f"{fid.hex()}_{serial or 'noserial'}_{time.strftime('%Y%m%d-%H%M%S')}")
     os.makedirs(os.path.join(out, "replies"))
@@ -125,14 +135,34 @@ def backup(s, root=DUMPS_DIR, data=False, log=print):
             f.write(reply)
     with open(os.path.join(out, "code.bin"), "wb") as f:
         f.write(code)
+    if bootfw:
+        with open(os.path.join(out, BOOTFW_FILE), "wb") as f:
+            f.write(hex_encode(bootfw))
     if data:
         sectors, bs, sha = read_disk(s, os.path.join(out, "disk.img"))
         manifest["disk"] = {"file": "disk.img", "sectors": sectors, "sector_size": bs, "sha256": sha}
         manifest["files"].append("disk.img")
     with open(os.path.join(out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    log(f"backup: {out}  (boot fw {manifest['boot_fw']['bundled_image'] or 'not a bundled image'})")
+    named = manifest["boot_fw"]["bundled_image"]
+    log(f"backup: {out}  (boot fw " + (f"captured, {'= ' + named if named else 'not a bundled image'}"
+                                       if bootfw else f"not captured, {named or 'not a bundled image'}")
+        + (f"; closest {image}, {frac:.0%} of the window" if image and image != named else "") + ")")
     return out
+
+
+def bundled_boot_fw(bootfw, fid):
+    """The bundled image a captured one is, outside the self-descriptor, or None."""
+    try:
+        return exact_boot_fw(bootfw, descriptor_mask(Geometry(fid), len(bootfw)))
+    except DataError:
+        return None
+
+
+def dump_bootfw(path):
+    """The boot image a backup captured, or None."""
+    name = json.load(open(os.path.join(path, "manifest.json")))["boot_fw"].get("image")
+    return hex_decode(open(os.path.join(path, name), "rb").read()) if name else None
 
 
 def load_dump(path):
@@ -264,7 +294,9 @@ def format_stick(dev, fid=None, *, bad_blocks="quick", erase="blocks", verify="n
         print(f"stick   : /dev/{dev} on port {live_port}, serial {st['serial'] or '-'}, "
               + ("LOCKED (ROM mode needed)" if st["locked"] else f"{(st['capacity'] or 0) * 512 / 1e9:.2f} GB"))
     print(f"format  : bad blocks {bad_blocks}, sweeps {sweeps}, skip {','.join(skip) or '-'}, "
-          f"capacity {capacity or 'every usable block'}" + (f", restore {restore_dump}" if restore_dump else ""))
+          f"capacity {capacity or 'every usable block'}, boot fw "
+          + ("the stick's own (the backup captures it)" if do_backup and not (st and st["locked"]) else "bundled")
+          + (f", restore {restore_dump}" if restore_dump else ""))
     if dry_run or not dev:
         if geo is None:
             raise SystemExit("the locked firmware refuses the flash ID read: give --flash-id")
@@ -294,15 +326,20 @@ def format_stick(dev, fid=None, *, bad_blocks="quick", erase="blocks", verify="n
         if capacity == "keep":
             capacity = disk_geometry(s)[0]
             print(f"capacity: keeping {capacity} sectors ({capacity * 512 / 1e9:.2f} GB)")
-        identity = load_dump(backup(s))[1] if do_backup else read(s, "config")
+        dump = backup(s) if do_backup else None
+        identity = load_dump(dump)[1] if dump else read(s, "config")
+        bootfw = dump_bootfw(dump) if dump else None
         if not config_valid(identity):
             identity = default_config()
             print(f"no valid config block: writing a generated one (serial {config_serial(identity)})")
         if restore_dump:
             manifest, identity = load_dump(restore_dump)
-            if manifest["boot_fw"]["bundled_image"] != boot_fw_image(geo.fid):
-                raise SystemExit(f"{restore_dump} ran boot image {manifest['boot_fw']['bundled_image']}; "
-                                 f"this format writes {boot_fw_image(geo.fid)}")
+            bootfw = dump_bootfw(restore_dump)
+            if not bootfw and manifest["boot_fw"]["bundled_image"] != boot_fw_image(geo.fid):
+                raise SystemExit(f"{restore_dump} ran boot image {manifest['boot_fw']['bundled_image']} and "
+                                 f"holds no captured image; this format would write {boot_fw_image(geo.fid)}")
+        print("boot fw : " + ("the stick's own, as the backup captured it" if bootfw
+                              else f"bundled {boot_fw_image(geo.fid)} (nothing captured)"), flush=True)
         if bad_blocks == "keep":
             mp = MpSession(s, geo).enable()
             tables = read_housekeeping(mp)
@@ -317,7 +354,7 @@ def format_stick(dev, fid=None, *, bad_blocks="quick", erase="blocks", verify="n
             mp.enable()
             live = s
         ops = provision.generate(geo, with_enable=live is None, identity=identity, sweeps=sweeps, skip=skip,
-                                 capacity_limit=capacity, kept_status=kept)
+                                 capacity_limit=capacity, kept_status=kept, bootfw=bootfw)
     except BaseException:
         s.close()
         raise
@@ -420,13 +457,16 @@ def read_fw_layout(mp, image, save=None):
 
 
 def load_fw_image(path, fid):
-    """(image, name): AlcorMP hex-text .BIN or raw bytes; None = the bundled image."""
+    """(image, name): a .BIN file or a backup directory's captured image; None = the
+    bundled image."""
     if path is None:
         return device_bootfw(fid), boot_fw_image(fid)
-    raw = open(path, "rb").read()
-    text = raw.strip()
-    hexy = text and all(c in b"0123456789abcdefABCDEF \t\r\n" for c in text)
-    return (hex_decode(raw) if hexy else raw), os.path.basename(path)
+    if os.path.isdir(path):
+        image = dump_bootfw(path)
+        if image is None:
+            raise SystemExit(f"{path}: the backup holds no captured boot image")
+        return image, f"{os.path.basename(os.path.normpath(path))}/{BOOTFW_FILE}"
+    return hex_decode(open(path, "rb").read()), os.path.basename(path)
 
 
 def update_firmware(dev, image_path=None, capacity=None, blind=False, yes=False, dry_run=False,
@@ -471,7 +511,11 @@ def update_firmware(dev, image_path=None, capacity=None, blind=False, yes=False,
             print(f"capacity: {sectors} -> {new} sectors ({new * 512 / 1e9:.2f} GB)"
                   + ("; WARNING: shrinking, data above the new size becomes unreachable" if new < sectors else ""))
         if dry_run:
-            print("dry run: read-back validated, nothing erased. The controller is in MP mode: replug the stick.")
+            s2 = restart(s, port)
+            if s2:
+                s2.close()
+            print("dry run: read-back validated, nothing erased; "
+                  + ("a USB reset left MP mode" if s2 else "the stick stayed in MP mode: replug it"))
             return None
         confirm(f"erase and rewrite system blocks {f700.SYS_BLOCK:#x} and {f700.MIRROR_BLOCK:#x}?", yes)
         layout = {"blocks": blocks, "image": image, "identity": identity, "boot": mp_info, "capacity": new}
@@ -576,6 +620,53 @@ def read_flash(s, geo, out, block, blocks=1, page=0, pages=1, sectors=None, sub=
     print("the controller is in MP mode: replug before normal use")
 
 
+def stick_xdata(s, pages=()):
+    """{page: 512 B} of XDATA in normal mode (FA 13): `pages` and those of the stick's NAND
+    set-up an own loader's patch window copies (f700.PATCH_FROM_STICK)."""
+    return {p: s.read(xdata_page_cdb(p), 512) for p in {*pages, *(a >> 8 for a in f700.PATCH_FROM_STICK.values())}}
+
+
+def xdata_bytes(pages):
+    return {(p << 8) + i: b for p, data in pages.items() for i, b in enumerate(data)}
+
+
+# == BOOT FIRMWARE CAPTURE ==
+def capture_boot_fw(s, code, log=print):
+    """(plaintext boot image, None) or (None, why): page0 from `code` (the CODE dump) and
+    every overlay as the ROM's overlay loader descrambles it (docs/processes.md). RAM only;
+    ends with a USB bus reset, after which `s` continues on the re-enumerated stick."""
+    try:
+        page0_loader_image(code)                               # page0 recognised, before any read
+        image = page0_loader_image(code, xdata_bytes(stick_xdata(s)))
+    except (LoaderError, BotError, OSError) as e:
+        return None, str(e)
+    port, size = s.port, f700.PAGE_SIZE_FW
+    pages, why = [code[f700.LOADER_BASE:f700.LOADER_BASE + size]], None
+    progress = Progress("boot firmware: overlay 0")
+    try:
+        s.cmd("mp_write")
+        s.cmd("loader", image)
+        if read_code(s, 512, f700.LOADER_BASE) != image[:512]:
+            raise BotError(f"CODE {f700.LOADER_BASE:#06x} does not read back as the upload")
+        for n in range(f700.BOOT_OVERLAYS):
+            progress.update(n, f700.BOOT_OVERLAYS, f"boot firmware: overlay {n}")
+            s.read(capture_cdb(n), 0)
+            ov = read_code(s, size, f700.OVERLAY_AT)
+            if ov[-4:] != bytes((n, n ^ 0xFF, 0x55, 0xAA)):
+                raise BotError(f"overlay {n} did not load (trailer {ov[-4:].hex(' ')})")
+            pages.append(ov)
+        progress.update(f700.BOOT_OVERLAYS, f700.BOOT_OVERLAYS)
+    except (BotError, OSError) as e:
+        why = f"capture failed: {e}"
+    finally:
+        progress.done(f"boot fw : {why}" if why else f"boot fw : page0 and {f700.BOOT_OVERLAYS} overlays captured")
+        s2 = restart(s, port)
+        if s2 is None:
+            raise BotError("the stick did not come back after the capture's USB reset; replug it")
+        s.takeover(s2)
+    return (None, why) if why else (b"".join(pages), None)
+
+
 @contextlib.contextmanager
 def own_loader(s, port, pages=(), log=print):
     """Run the tool's probe loader (alcor/loaders/probe.a51, no AlcorMP code) on session `s`:
@@ -583,9 +674,8 @@ def own_loader(s, port, pages=(), log=print):
     resident and answers, yield {"iram": internal RAM, "before": {page: XDATA read before}}.
     On leaving: a USB bus reset from the session, which restarts the firmware from NAND (an
     FA 08 does not: docs/processes.md), then ["after"] = the stick's state."""
-    want = {*pages, *(a >> 8 for a in f700.PATCH_FROM_STICK.values())}
-    before = {p: s.read(xdata_page_cdb(p), 512) for p in want}
-    image = own_loader_image("probe", {(p << 8) + i: b for p, data in before.items() for i, b in enumerate(data)})
+    before = stick_xdata(s, pages)
+    image = own_loader_image("probe", xdata_bytes(before))
     ctx = {"before": before}
     try:
         s.cmd("mp_write")

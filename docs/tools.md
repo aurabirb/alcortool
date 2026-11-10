@@ -144,7 +144,8 @@ One directory per backup, `firmware/dumps/<flash id>_<serial>_<YYYYmmdd-HHMMSS>/
 |---|---|
 | `replies/<name>.bin` | every read-only command's reply, the config block among them |
 | `code.bin` | the 64-KB CODE space |
-| `manifest.json` | chip, flash ID, serial, firmware revision, boot image and window hash, disk geometry and sha256 |
+| `bootfw.bin` | the boot firmware, [captured](processes.md#capturing-the-boot-firmware) |
+| `manifest.json` | chip, flash ID, serial, firmware revision, boot image, disk geometry and sha256 |
 | `disk.img` | with `--data`: the logical disk, sparse |
 
 ## Internal tools
